@@ -6,53 +6,59 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <syslog.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+
+#define LIBHOOK_DENY_PATH "/etc/proftpd/libhook.deny"
 
 typedef DIR *(*OPEN_T)(const char *name);
 typedef struct dirent *(*READ_T)(DIR *dirp);
-
-typedef int (*CHDIR_T)(const char *path);
+typedef int (*CHROOT_T)(const char *path);
 
 static OPEN_T real_opendir = NULL;
 static READ_T real_readdir = NULL;
 static READ_T real_readdir64 = NULL;
-static CHDIR_T real_chdir = NULL;
+static CHROOT_T real_chroot = NULL;
+
 
 /* 
-    override 
-    0 - do nothing
-    1 - netapp (append hidden .snapshot)
-    2 - zfs (append hidden .zfs/snapshot as .snapshot, override when chdir)
+ *   readdir_override 
+ *   0 - do nothing
+ *   1 - netapp - .snapshot is hidden, we append it to last readdir call
+ *       or hide when not allowed (zfs has visible .snapshot dirs)
 */
-static int override = 0;
+static int readdir_override = 0;
+static int visible_snapshot = 0; 
+
+static int allowed = 1;
 
 DIR *opendir(const char *name) {
     void *handle = dlopen("/lib/x86_64-linux-gnu/libc.so.6", RTLD_LAZY);
     char *real_path;
     char buf[PATH_MAX+1];
 
+    visible_snapshot=0;
+
     if (!real_opendir) real_opendir = (OPEN_T) dlsym(handle, "opendir");
     if (!real_readdir) real_readdir = (READ_T) dlsym(handle, "readdir");
     if (!real_readdir64) real_readdir64 = (READ_T) dlsym(handle, "readdir64");
-    if (!real_chdir) real_chdir = (CHDIR_T) dlsym(handle, "chdir");
+    if (!real_chroot) real_chroot = (CHROOT_T) dlsym(handle, "chroot");
 
     real_path=realpath(name, NULL);
+    /* check for .snapshot directory only at root path (/) */
     if (real_path && real_path[0]=='/' && real_path[1]=='\0') {
-        override=0;
-        /* we use access() to check if there is .snapshot or .zfs/snapshot directory */
+        readdir_override=0;
+        /* we use access() to check if there is .snapshot */
         snprintf(buf, PATH_MAX, "%s/%s", real_path, ".snapshot");
         if (!access(buf, R_OK)) {
-            override=1;
-        } else {
-            snprintf(buf, PATH_MAX, "%s/%s", real_path, ".zfs/snapshot");
-            if (!access(buf, R_OK)) {
-                override=2;
-            }
+            readdir_override=1;
         }
 
         free(real_path);
     } else {
         /* realpath return NULL ? */
-        override=0;
+        readdir_override=0;
     }
 
     DIR *dirp = real_opendir(name);
@@ -60,7 +66,9 @@ DIR *opendir(const char *name) {
     return dirp;
 }
 
-struct dirent *readdir(DIR *dirp)
+
+
+struct dirent *fake_readdir(DIR *dirp)
 {
     /* statically allocated variables */
     /* fake dirent appended to end of list */
@@ -73,8 +81,8 @@ struct dirent *readdir(DIR *dirp)
     ret=real_readdir(dirp);
 
     if (ret==NULL) {
-        /* if we are at end of list append our dirent */
-        if (override && !real_end) {
+        /* if we are at end of list append fake dirent */
+        if (readdir_override && !real_end && !visible_snapshot && allowed) {
             real_end=1;
 
             sprintf(fake_dirent.d_name, ".snapshot");
@@ -86,66 +94,168 @@ struct dirent *readdir(DIR *dirp)
         }
     } else {
         real_end=0;
+        /* in case of zfs .snapshot dir is visible, so set variable and do not append fake one at end */
+        if (!strncmp(ret->d_name, ".snapshot", 9)) {
+            visible_snapshot=1;
+
+            /* in case this path is not allowed, hide .snapshot (call next readdir) */
+            if (!allowed) {
+                syslog(LOG_DAEMON|LOG_ALERT, "zfs not allowed");
+                return fake_readdir(dirp);
+            }
+        }
         return ret;
     }
+}
+
+struct dirent *readdir(DIR *dirp)
+{
+    return fake_readdir(dirp);
 }
 
 struct dirent *readdir64(DIR *dirp)
 {
-    /* statically allocated variables */
-    /* fake dirent appended to end of list */
-    static struct dirent fake_dirent;
-    /* variable to check if we are at end of list */
-    static int real_end=0; 
-
-    struct dirent *ret;
-
-    ret=real_readdir64(dirp);
-
-    if (ret==NULL) {
-        /* if we are at end of list append our dirent */
-        if (override && !real_end) {
-            real_end=1;
-
-            sprintf(fake_dirent.d_name, ".snapshot");
-            fake_dirent.d_type=DT_DIR;
-
-            return &fake_dirent;
-        } else {
-            return NULL;
-        }
-    } else {
-        real_end=0;
-        return ret;
-    }
+    return fake_readdir(dirp);
 }
 
-int chdir (const char *path) {
-    char newdir[PATH_MAX+1];
-    char olddir[PATH_MAX+1];
-    int ret;
-    char *real_path;
-    char cwd[PATH_MAX+1];
+/* 
+ * chroot hook
+ *  - traverse path from end and check if there exists %s/.zfs/snapshot
+ *  - in case we are on zfs check if chroot path has directories in individual snapshots
+ *  - in case there are snapshots bind mount it to path/.snapshot/snapshot_name
+ */
+int chroot(const char *path) {
     char buf[PATH_MAX+1];
+    char tmpbuf[PATH_MAX+1];
+    char *ptr;
+    int zfs=0;
+    char zfsbasepath[PATH_MAX+1];
+    char appendpath[PATH_MAX+1];
+    char mkdirpath[PATH_MAX+1];
+    
+    /* traverse path and check if there is .zfs/snapshot dir */
+    strncpy(buf, path, PATH_MAX);
 
-    void *handle = dlopen("/lib/x86_64-linux-gnu/libc.so.6", RTLD_LAZY);
+    while((ptr=strrchr(buf,'/'))) {
+        *ptr='\0';
 
-    if (!real_opendir) real_opendir = (OPEN_T) dlsym(handle, "opendir");
-    if (!real_readdir) real_readdir = (READ_T) dlsym(handle, "readdir");
-    if (!real_readdir64) real_readdir64 = (READ_T) dlsym(handle, "readdir64");
-    if (!real_chdir) real_chdir = (CHDIR_T) dlsym(handle, "chdir");
+        snprintf(tmpbuf, PATH_MAX, "%s%s", buf, "/.zfs/snapshot");
+        syslog(LOG_DAEMON|LOG_ALERT, "tmpbuf: %s",  tmpbuf);
 
-    /* if we are on zfs filesystem we replace .snapshot to .zfs/snapshot when chdir */
-    if (override==2 && strlen(path)>9 && !strcmp(path + strlen(path) - 9, ".snapshot")) {
-        strncpy(olddir, path, PATH_MAX);
-        olddir[strlen(olddir)-9] = '\0';
-        snprintf(newdir, PATH_MAX, "%s/.zfs/snapshot", olddir);
-        ret=real_chdir(newdir);
-    } else {
-        ret=real_chdir(path);
+        if (!access(tmpbuf, R_OK)) {
+            zfs=1;
+            strncpy(zfsbasepath, tmpbuf, PATH_MAX);
+            strncpy(appendpath, path+strlen(buf)+1, PATH_MAX);
+            break;
+        }
     }
 
-    return ret;
+    
+    allowed=check_if_allowed(path);
+
+    if (zfs==1 && allowed) {
+        DIR *dirp;
+        struct dirent *dp;
+
+        syslog(LOG_DAEMON|LOG_ALERT, "zfsbasepath: %s %s",  zfsbasepath, appendpath);
+
+        if ((dirp=real_opendir(zfsbasepath))!=NULL) {
+            do {
+                if ((dp = readdir(dirp)) != NULL) {
+                    if (dp->d_type==DT_DIR && dp->d_name[0]!='.') {
+                        snprintf(tmpbuf, PATH_MAX, "%s/%s/%s", zfsbasepath, dp->d_name, appendpath);
+
+                        if (!access(tmpbuf, R_OK)) {
+                            /* directory exist in snapshot, bind mount it*/
+
+                            snprintf(mkdirpath, PATH_MAX, "%s/%s", path, ".snapshot");
+                            if (access(mkdirpath, R_OK)) {
+                                mkdir(mkdirpath, 0755);
+                            }
+                            syslog(LOG_DAEMON|LOG_ALERT, "mkdirpath: %s",  mkdirpath);
+
+                            snprintf(mkdirpath, PATH_MAX, "%s/%s/%s", path, ".snapshot", dp->d_name);
+                            if (access(mkdirpath, R_OK)) {
+                                mkdir(mkdirpath, 0755);
+                            }
+                            syslog(LOG_DAEMON|LOG_ALERT, "mkdirpath: %s",  mkdirpath);
+                            
+                            /* check if dir is already mounted */
+                            if (!check_if_mounted(mkdirpath)) {
+                                syslog(LOG_DAEMON|LOG_ALERT, "mounting: %s -> %s",  tmpbuf, mkdirpath);
+                                mount(tmpbuf, mkdirpath, "auto", MS_BIND, NULL);
+                            } else {
+                                syslog(LOG_DAEMON|LOG_ALERT, "already mounted: %s -> %s",  tmpbuf, mkdirpath);
+                            }
+                        }
+                    }
+                }
+            } while (dp != NULL);
+            closedir(dirp);
+        }
+    }
+
+    return real_chroot(path);
 }
 
+/*
+ * int check_if_mounted(path) - check if path is mounted from /proc/mounts
+ * return 0 path is not mounted 
+ * return 1 path is mounted 
+ */
 
+int check_if_mounted(char *path)
+{
+    FILE *fp;
+    char buf[4096];
+    int found=0;
+
+    fp=fopen("/proc/mounts", "r");
+    while (fgets(buf, 4096, fp)) {
+        if (strstr(buf, path)) {
+            found=1;
+            break;
+        }
+    }
+    
+    fclose(fp);
+
+    return found;
+}
+
+/*
+ * int check_if_allowed(path) - check if path has allowed .snapshot visibility and mounting in case of zfs
+ * return 0 if not allowed
+ * return 1 otherwise
+ */
+
+int check_if_allowed(char *path) {
+    FILE *fp;
+    char buf[4096];
+    int allowed=1;
+
+    if (access(LIBHOOK_DENY_PATH, R_OK)) {
+        return allowed;
+    }
+
+    fp=fopen(LIBHOOK_DENY_PATH, "r");
+    while (fgets(buf, 4096, fp)) {
+        /* remove ending newline */
+        buf[strlen(buf)]='\0';
+        if (strstr(path, buf)) {
+            allowed=0;
+            break;
+        }
+
+        /* in case string ALL we disallow */
+        if (strstr(buf, "ALL")) {
+            allowed=0;
+            break;
+        }
+    }
+    
+    fclose(fp);
+
+    return allowed;
+
+}
