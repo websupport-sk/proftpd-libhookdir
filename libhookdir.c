@@ -6,9 +6,11 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <syslog.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#ifdef DEBUG
+#include <syslog.h>
+#endif
 
 #define LIBHOOK_DENY_PATH "/etc/proftpd/libhook.deny"
 /* ZFS only: do not create and mount .snapshot if there is more than this number of parent directorries with non-root uid */
@@ -25,11 +27,10 @@ static CHROOT_T real_chroot = NULL;
 
 
 /* 
- *   readdir_override 
+ *   readdir_override is set from opendir()
  *   0 - do nothing
- *   1 - netapp - .snapshot is hidden, we append it to last readdir call
- *       or hide when not allowed (zfs has visible .snapshot dirs)
-*/
+ *   1 - netapp/zfs - if .snapshot exists show it (in case of netapp), or hide it (in case of proftpd + path in libhook.deny file)
+ */
 static int readdir_override = 0;
 static int visible_snapshot = 0; 
 
@@ -102,7 +103,9 @@ struct dirent *fake_readdir(DIR *dirp)
 
             /* in case this path is not allowed, hide .snapshot (call next readdir) */
             if (!allowed) {
+#ifdef DEBUG
                 syslog(LOG_DAEMON|LOG_ALERT, "zfs not allowed");
+#endif
                 return fake_readdir(dirp);
             }
         }
@@ -123,7 +126,7 @@ struct dirent *readdir64(DIR *dirp)
 /* 
  * chroot hook
  *  - traverse path from end and check if there exists %s/.zfs/snapshot
- *  - in case we are on zfs check if chroot path has directories in individual snapshots
+ *  - in case we are on zfs, check if chroot path has directories in individual snapshots
  *  - in case there are snapshots bind mount it to path/.snapshot/snapshot_name
  */
 int chroot(const char *path) {
@@ -149,7 +152,9 @@ int chroot(const char *path) {
         }
 
         snprintf(tmpbuf, PATH_MAX, "%s%s", buf, "/.zfs/snapshot");
+#ifdef DEBUG
         syslog(LOG_DAEMON|LOG_ALERT, "tmpbuf: %s non-root-count: %d",  tmpbuf, nonroot_count);
+#endif
 
         if (!access(tmpbuf, R_OK)) {
             zfs=1;
@@ -166,7 +171,9 @@ int chroot(const char *path) {
         DIR *dirp;
         struct dirent *dp;
 
+#ifdef DEBUG
         syslog(LOG_DAEMON|LOG_ALERT, "zfsbasepath: %s %s",  zfsbasepath, appendpath);
+#endif
 
         if ((dirp=real_opendir(zfsbasepath))!=NULL) {
             do {
@@ -181,20 +188,29 @@ int chroot(const char *path) {
                             if (access(mkdirpath, R_OK)) {
                                 mkdir(mkdirpath, 0755);
                             }
+    
+#ifdef DEBUG
                             syslog(LOG_DAEMON|LOG_ALERT, "mkdirpath: %s",  mkdirpath);
+#endif
 
                             snprintf(mkdirpath, PATH_MAX, "%s/%s/%s", path, ".snapshot", dp->d_name);
                             if (access(mkdirpath, R_OK)) {
                                 mkdir(mkdirpath, 0755);
                             }
+#ifdef DEBUG
                             syslog(LOG_DAEMON|LOG_ALERT, "mkdirpath: %s",  mkdirpath);
+#endif
                             
                             /* check if dir is already mounted */
                             if (!check_if_mounted(mkdirpath)) {
+#ifdef DEBUG
                                 syslog(LOG_DAEMON|LOG_ALERT, "mounting: %s -> %s",  tmpbuf, mkdirpath);
+#endif
                                 mount(tmpbuf, mkdirpath, "auto", MS_BIND, NULL);
                             } else {
+#ifdef DEBUG
                                 syslog(LOG_DAEMON|LOG_ALERT, "already mounted: %s -> %s",  tmpbuf, mkdirpath);
+#endif
                             }
                         }
                     }
