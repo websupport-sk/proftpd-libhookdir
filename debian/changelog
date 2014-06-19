@@ -1,0 +1,5 @@
+proftpd-libhookdir (1.0-1) unstable; urgency=low
+
+  * Initial release (Closes: #nnnn)  <nnnn is the bug number of your ITP>
+
+ -- Pavel Stano <pavel.stano@websupport.sk>  Thu, 19 Jun 2014 22:27:15 +0200

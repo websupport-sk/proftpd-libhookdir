@@ -1,0 +1,13 @@
+Source: proftpd-libhookdir
+Section: unknown
+Priority: extra
+Maintainer: Pavel Stano <pavel.stano@websupport.sk>
+Build-Depends: debhelper (>= 8.0.0)
+Standards-Version: 3.9.2
+Homepage: https://github.com/websupport-sk/proftpd-libhookdir
+
+Package: proftpd-libhookdir
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, proftpd-basic
+Description: <insert up to 60 chars description>
+ <insert long description, indented with spaces>
