@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 
 #define LIBHOOK_DENY_PATH "/etc/proftpd/libhook.deny"
+/* ZFS only: do not create and mount .snapshot if there is more than this number of parent directorries with non-root uid */
+#define MAX_NONROOT_PARENT_DIRS_COUNT 1
 
 typedef DIR *(*OPEN_T)(const char *name);
 typedef struct dirent *(*READ_T)(DIR *dirp);
@@ -132,6 +134,8 @@ int chroot(const char *path) {
     char zfsbasepath[PATH_MAX+1];
     char appendpath[PATH_MAX+1];
     char mkdirpath[PATH_MAX+1];
+    struct stat statb;
+    int nonroot_count=0;
     
     /* traverse path and check if there is .zfs/snapshot dir */
     strncpy(buf, path, PATH_MAX);
@@ -139,8 +143,13 @@ int chroot(const char *path) {
     while((ptr=strrchr(buf,'/'))) {
         *ptr='\0';
 
+        stat(buf, &statb);
+        if (statb.st_uid!=0) {
+            nonroot_count++;
+        }
+
         snprintf(tmpbuf, PATH_MAX, "%s%s", buf, "/.zfs/snapshot");
-        syslog(LOG_DAEMON|LOG_ALERT, "tmpbuf: %s",  tmpbuf);
+        syslog(LOG_DAEMON|LOG_ALERT, "tmpbuf: %s non-root-count: %d",  tmpbuf, nonroot_count);
 
         if (!access(tmpbuf, R_OK)) {
             zfs=1;
@@ -153,7 +162,7 @@ int chroot(const char *path) {
     
     allowed=check_if_allowed(path);
 
-    if (zfs==1 && allowed) {
+    if (zfs==1 && allowed && nonroot_count<=MAX_NONROOT_PARENT_DIRS_COUNT) {
         DIR *dirp;
         struct dirent *dp;
 
