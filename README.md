@@ -23,4 +23,8 @@ Usage example:
 
 gcc libhookdir.c -g -shared -fPIC -o libhookdir.so
 
-LD_PRELOAD=/root/libhookdir.so proftpd
+add to /etc/default/proftpd:
+
+export LD_PRELOAD=/usr/lib/proftpd/libhookdir.so proftpd
+
+
